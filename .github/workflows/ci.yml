@@ -1,33 +1,138 @@
-name: CI Pipeline
+name: CD - Build Docker, Push to ACR, Deploy to Azure Container Apps
 
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*" ]
 
 jobs:
   build_test:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up JDK 11
+      - name: Set up JDK 8
         uses: actions/setup-java@v4
         with:
           java-version: '8'
           distribution: 'corretto'
+      - name: Build and Test
+        run: mvn -B package --file pom.xml
 
-      - name: Build
-        run: mvn clean compile
+  deploy_staging:
+    needs: build_test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Test
-        run: mvn test
-
-      - name: Package
-        run: mvn package
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
         with:
-          name: app-jar
-          path: target/*.jar
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init & Apply (staging)
+        run: |
+          cd iac
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=${{ vars.TFSTATE_KEY_STAGING }}"
+          terraform apply -auto-approve \
+            -var="suffix=${{ vars.SUFFIX }}" \
+            -var="environment=staging" \
+            -var="location=${{ vars.AZURE_LOCATION }}" \
+            -var="image_tag=bootstrap"
+
+      - name: Get ACR name
+        id: acr
+        run: |
+          cd iac
+          echo "acr_server=$(terraform output -raw acr_login_server)" >> $GITHUB_OUTPUT
+
+      - name: Build & Push image to ACR
+        run: |
+          az acr build \
+            --registry ${{ steps.acr.outputs.acr_server }} \
+            --image hola:${{ github.sha }} \
+            .
+
+      - name: Deploy image to Container App
+        run: |
+          cd iac
+          terraform apply -auto-approve \
+            -var="suffix=${{ vars.SUFFIX }}" \
+            -var="environment=staging" \
+            -var="location=${{ vars.AZURE_LOCATION }}" \
+            -var="image_tag=${{ github.sha }}"
+
+  deploy_production:
+    needs: build_test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init & Apply (production)
+        run: |
+          cd iac
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=${{ vars.TFSTATE_KEY_PRODUCTION }}"
+          terraform apply -auto-approve \
+            -var="suffix=${{ vars.SUFFIX }}" \
+            -var="environment=production" \
+            -var="location=${{ vars.AZURE_LOCATION }}" \
+            -var="image_tag=bootstrap"
+
+      - name: Get ACR name
+        id: acr
+        run: |
+          cd iac
+          echo "acr_server=$(terraform output -raw acr_login_server)" >> $GITHUB_OUTPUT
+
+      - name: Build & Push image to ACR
+        run: |
+          az acr build \
+            --registry ${{ steps.acr.outputs.acr_server }} \
+            --image hola:${{ github.ref_name }} \
+            .
+
+      - name: Deploy image to Container App
+        run: |
+          cd iac
+          terraform apply -auto-approve \
+            -var="suffix=${{ vars.SUFFIX }}" \
+            -var="environment=production" \
+            -var="location=${{ vars.AZURE_LOCATION }}" \
+            -var="image_tag=${{ github.ref_name }}"
